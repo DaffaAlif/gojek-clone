@@ -45,6 +45,8 @@ DRIVER_START = {"lat": -6.2090, "lng": 106.8460}
 PICKUP_LOC   = {"lat": -6.2150, "lng": 106.8400}
 DEST_LOC     = {"lat": -6.2300, "lng": 106.8600}
 
+STEP_SIZE = 0.001  # coordinate units per tracking step
+
 # ─── Helper ───────────────────────────────────────────────────────────────────
 
 def haversine(lat1, lng1, lat2, lng2):
@@ -58,7 +60,7 @@ def haversine(lat1, lng1, lat2, lng2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def move_towards(clat, clng, tlat, tlng, step=0.005):
+def move_towards(clat, clng, tlat, tlng, step=0.001):
     d_lat = tlat - clat
     d_lng = tlng - clng
     dist = math.sqrt(d_lat ** 2 + d_lng ** 2)
@@ -66,6 +68,21 @@ def move_towards(clat, clng, tlat, tlng, step=0.005):
         return tlat, tlng, True
     ratio = step / dist
     return clat + d_lat * ratio, clng + d_lng * ratio, False
+
+
+def count_steps(slat, slng, tlat, tlng, step=STEP_SIZE):
+    lat, lng = slat, slng
+    n = 0
+    while True:
+        d_lat = tlat - lat
+        d_lng = tlng - lng
+        dist = math.sqrt(d_lat ** 2 + d_lng ** 2)
+        if dist < step:
+            return n + 1
+        ratio = step / dist
+        lat += d_lat * ratio
+        lng += d_lng * ratio
+        n += 1
 
 
 def now_str():
@@ -171,7 +188,7 @@ def do_matching(producer, driver_pos, rider_request):
 
 # ─── Stage: Tracking (step-by-step movement) ─────────────────────────────────
 
-def do_tracking(producer, match_info):
+def do_tracking(producer, match_info, sleep_secs=0.2):
     """Simulate driver moving to pickup then to destination. Returns True on success."""
     pos = dict(DRIVER_START)
     phase = "to_pickup"
@@ -206,7 +223,7 @@ def do_tracking(producer, match_info):
         new_lat, new_lng, arrived = move_towards(
             pos['lat'], pos['lng'],
             target['lat'], target['lng'],
-            step=0.005
+            step=STEP_SIZE,
         )
         pos = {"lat": new_lat, "lng": new_lng}
 
@@ -260,6 +277,8 @@ def do_tracking(producer, match_info):
 
         log("📍", f"{DRIVER['name']} | {phase_label} | Sisa: {distance_to_target:.3f} km | ETA: {eta} menit")
 
+        time.sleep(sleep_secs)
+
         if arrived:
             if phase == "to_pickup":
                 # Publish picked_up status
@@ -293,22 +312,33 @@ def do_tracking(producer, match_info):
                 log("🏁", f"Perjalanan selesai! {DRIVER['name']} mengantar {RIDER['name']}")
                 return True
 
-        time.sleep(0.2)
-
     log("⚠️", "Batas langkah tercapai sebelum perjalanan selesai")
     return False
 
 
 # ─── Main simulation ──────────────────────────────────────────────────────────
 
-def run_simulation(timeout):
+def run_simulation(timeout, duration=60):
     result = {"success": False}
+
+    # Pre-calculate total tracking steps to distribute time evenly
+    fixed_overhead = 3  # 3x time.sleep(1) before tracking starts
+    steps_to_pickup = count_steps(
+        DRIVER_START['lat'], DRIVER_START['lng'],
+        PICKUP_LOC['lat'],   PICKUP_LOC['lng'],
+    )
+    steps_to_dest = count_steps(
+        PICKUP_LOC['lat'],  PICKUP_LOC['lng'],
+        DEST_LOC['lat'],    DEST_LOC['lng'],
+    )
+    total_steps = steps_to_pickup + steps_to_dest
+    sleep_secs = max(0.05, (duration - fixed_overhead) / total_steps)
 
     def _run():
         try:
             producer = Producer(KAFKA_CONFIG)
 
-            log("🚀", "Simulasi dimulai: 1 Driver + 1 Rider")
+            log("🚀", f"Simulasi dimulai: 1 Driver + 1 Rider (durasi ~{duration}s, {total_steps} langkah, {sleep_secs:.2f}s/langkah)")
             print("─" * 60, flush=True)
 
             # 1) Publish posisi awal driver
@@ -334,7 +364,7 @@ def run_simulation(timeout):
 
             # 4) Tracking + status updates
             log("🛤️", "Tracking perjalanan dimulai...")
-            success = do_tracking(producer, match_info)
+            success = do_tracking(producer, match_info, sleep_secs=sleep_secs)
 
             print("─" * 60, flush=True)
             if success:
@@ -361,9 +391,12 @@ def run_simulation(timeout):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Simulasi 1 driver + 1 rider")
-    parser.add_argument("--timeout", "-t", type=int, default=120,
-                        help="Timeout dalam detik (default: 120)")
+    parser.add_argument("--duration", "-d", type=int, default=60,
+                        help="Durasi simulasi dalam detik (default: 60)")
+    parser.add_argument("--timeout", "-t", type=int, default=None,
+                        help="Timeout paksa dalam detik (default: duration + 30)")
     args = parser.parse_args()
 
-    success = run_simulation(args.timeout)
+    timeout = args.timeout if args.timeout else args.duration + 30
+    success = run_simulation(timeout, duration=args.duration)
     sys.exit(0 if success else 1)
