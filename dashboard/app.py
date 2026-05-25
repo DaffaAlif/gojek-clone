@@ -13,8 +13,6 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import KAFKA_CONFIG, TOPICS
 import dashboard.state as state
 
-# ── Live data file (read by the Leaflet map via fetch) ────────────────────────
-
 STATIC_DIR     = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 LIVE_DATA_PATH = os.path.join(STATIC_DIR, 'live_data.json')
 _file_lock     = threading.Lock()
@@ -163,6 +161,7 @@ MAP_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8"/>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: sans-serif; }
@@ -178,19 +177,18 @@ MAP_HTML = """<!DOCTYPE html>
       position: absolute; bottom: 24px; left: 12px; z-index: 1000;
       background: rgba(255,255,255,0.92); padding: 8px 12px;
       border-radius: 6px; font-size: 12px;
-      box-shadow: 0 1px 4px rgba(0,0,0,0.2); line-height: 1.8;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.2); line-height: 2;
     }
-    .dot { display:inline-block; width:11px; height:11px;
-           border-radius:50%; margin-right:5px; vertical-align:middle; }
+    .fa-map-pin, .fa-car, .fa-motorcycle { margin-right: 6px; }
   </style>
 </head>
 <body>
   <div id="map"></div>
   <div id="infobox">Menunggu data...</div>
   <div id="legend">
-    <span class="dot" style="background:#ff6d00"></span> Driver<br>
-    <span class="dot" style="background:#2e7d32"></span> Pickup<br>
-    <span class="dot" style="background:#c62828"></span> Tujuan
+    <i class="fa-solid fa-car" style="color:#ff6d00"></i> Driver<br>
+    <i class="fa-solid fa-map-pin" style="color:#2e7d32"></i> Pickup<br>
+    <i class="fa-solid fa-map-pin" style="color:#c62828"></i> Tujuan
   </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -200,14 +198,30 @@ MAP_HTML = """<!DOCTYPE html>
       attribution: 'OpenStreetMap'
     }).addTo(map);
 
-    function circleIcon(color, size) {
-      size = size || 16;
+    function pinIcon(color, faClass) {
       return L.divIcon({
-        html: '<div style="background:' + color + ';width:' + size + 'px;height:' + size +
-              'px;border-radius:50%;border:3px solid white;' +
-              'box-shadow:0 1px 4px rgba(0,0,0,0.4)"></div>',
-        iconSize:   [size + 6, size + 6],
-        iconAnchor: [(size + 6) / 2, (size + 6) / 2],
+        html: '<div style="position:relative;width:32px;height:42px;text-align:center;">' +
+              '<i class="fa-solid ' + faClass + '" style="font-size:36px;color:' + color +
+              ';filter:drop-shadow(0 2px 3px rgba(0,0,0,0.4));line-height:1"></i>' +
+              '</div>',
+        iconSize:   [32, 42],
+        iconAnchor: [16, 42],
+        popupAnchor:[0, -44],
+        className: ''
+      });
+    }
+
+    function driverIcon(vehicle) {
+      var faClass = (vehicle === 'motorcycle') ? 'fa-motorcycle' : 'fa-car';
+      return L.divIcon({
+        html: '<div style="background:#ff6d00;border-radius:50%;width:36px;height:36px;' +
+              'display:flex;align-items:center;justify-content:center;' +
+              'border:3px solid white;box-shadow:0 2px 6px rgba(0,0,0,0.5);">' +
+              '<i class="fa-solid ' + faClass + '" style="color:white;font-size:16px;"></i>' +
+              '</div>',
+        iconSize:   [36, 36],
+        iconAnchor: [18, 18],
+        popupAnchor:[0, -20],
         className: ''
       });
     }
@@ -216,16 +230,18 @@ MAP_HTML = """<!DOCTYPE html>
     var pickupMarker = null;
     var destMarker   = null;
     var currentRider = null;
+    var currentVehicle = null;
     var firstLoad    = true;
 
-    var DATA_URL = 'http://localhost:8501/app/static/live_data.json';
+    var DATA_URL = 'http://localhost:8502/live_data.json';
 
     function clearMarkers() {
       if (driverMarker) { map.removeLayer(driverMarker); driverMarker = null; }
       if (pickupMarker) { map.removeLayer(pickupMarker); pickupMarker = null; }
       if (destMarker)   { map.removeLayer(destMarker);   destMarker   = null; }
-      currentRider = null;
-      firstLoad    = true;
+      currentRider   = null;
+      currentVehicle = null;
+      firstLoad      = true;
     }
 
     function update() {
@@ -245,29 +261,32 @@ MAP_HTML = """<!DOCTYPE html>
           // Reset markers when a new ride starts
           if (currentRider !== d.rider_name) {
             clearMarkers();
-            currentRider = d.rider_name;
+            currentRider   = d.rider_name;
+            currentVehicle = d.vehicle;
           }
 
-          // Driver marker
+          // Driver marker — car or motorcycle icon inside orange circle
           if (!driverMarker) {
-            driverMarker = L.marker([d.lat, d.lng], {icon: circleIcon('#ff6d00', 16)})
+            driverMarker = L.marker([d.lat, d.lng], {icon: driverIcon(d.vehicle)})
               .bindPopup('<b>' + d.driver_name + '</b><br>' + d.phase_label)
               .addTo(map);
           } else {
             driverMarker.setLatLng([d.lat, d.lng]);
           }
 
-          // Pickup marker (created once)
+          // Pickup marker — green map-pin (created once)
           if (d.pickup && !pickupMarker) {
-            pickupMarker = L.marker([d.pickup.lat, d.pickup.lng], {icon: circleIcon('#2e7d32', 13)})
-              .bindPopup('Pickup: ' + d.rider_name)
+            pickupMarker = L.marker([d.pickup.lat, d.pickup.lng],
+              {icon: pinIcon('#2e7d32', 'fa-map-pin')})
+              .bindPopup('<b>Pickup</b><br>' + d.rider_name)
               .addTo(map);
           }
 
-          // Destination marker (created once)
+          // Destination marker — red map-pin (created once)
           if (d.destination && !destMarker) {
-            destMarker = L.marker([d.destination.lat, d.destination.lng], {icon: circleIcon('#c62828', 13)})
-              .bindPopup('Tujuan: ' + d.rider_name)
+            destMarker = L.marker([d.destination.lat, d.destination.lng],
+              {icon: pinIcon('#c62828', 'fa-map-pin')})
+              .bindPopup('<b>Tujuan</b><br>' + d.rider_name)
               .addTo(map);
           }
 

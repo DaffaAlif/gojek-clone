@@ -107,6 +107,25 @@ pipeline {
             }
         }
 
+        // ── 7. E2E Real-World Test (60 detik) ────────────────────────────────
+        stage('E2E Real-World Test (60s)') {
+            steps {
+                echo '── Menjalankan end-to-end test 60 detik dengan 3 driver + 3 rider ──'
+                sh '''
+                    PYTHONUTF8=1 ${VENV}/bin/pytest tests/test_e2e_realworld.py \
+                        -v \
+                        -s \
+                        --timeout=90 \
+                        --junitxml=${REPORTS_DIR}/e2e-tests.xml
+                '''
+            }
+            post {
+                always {
+                    junit "${REPORTS_DIR}/e2e-tests.xml"
+                }
+            }
+        }
+
     }
 
     // ── Post-pipeline actions ────────────────────────────────────────────────

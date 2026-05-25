@@ -28,6 +28,45 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from confluent_kafka import Producer, Consumer, KafkaError
 from config import KAFKA_CONFIG, TOPICS
 
+# ─── live_data.json writer (untuk Leaflet map di dashboard) ──────────────────
+
+_LIVE_DATA_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    'dashboard', 'static', 'live_data.json'
+)
+
+
+def _write_live(driver, phase_label, lat, lng, pickup, destination, distance_km, eta_minutes):
+    payload = {
+        "drivers": [{
+            "driver_id":   driver['driver_id'],
+            "driver_name": driver['name'],
+            "rider_name":  RIDER['name'],
+            "vehicle":     driver['vehicle'],
+            "lat":         round(lat, 6),
+            "lng":         round(lng, 6),
+            "phase_label": phase_label,
+            "distance_km": round(distance_km, 2),
+            "eta_minutes": eta_minutes,
+            "pickup":      pickup,
+            "destination": destination,
+        }],
+        "updated_at": datetime.now().isoformat(),
+    }
+    try:
+        with open(_LIVE_DATA_PATH, 'w') as f:
+            json.dump(payload, f)
+    except Exception:
+        pass
+
+
+def _clear_live():
+    try:
+        with open(_LIVE_DATA_PATH, 'w') as f:
+            json.dump({"drivers": [], "updated_at": datetime.now().isoformat()}, f)
+    except Exception:
+        pass
+
 # ─── Konfigurasi simulasi ─────────────────────────────────────────────────────
 
 DRIVER = {
@@ -275,6 +314,13 @@ def do_tracking(producer, match_info, sleep_secs=0.2):
         )
         producer.flush()
 
+        # Tulis posisi terkini ke live_data.json untuk Leaflet map
+        _write_live(
+            DRIVER, phase_label, new_lat, new_lng,
+            match_info['pickup'], match_info['destination'],
+            distance_to_target, eta,
+        )
+
         log("📍", f"{DRIVER['name']} | {phase_label} | Sisa: {distance_to_target:.3f} km | ETA: {eta} menit")
 
         time.sleep(sleep_secs)
@@ -310,6 +356,7 @@ def do_tracking(producer, match_info, sleep_secs=0.2):
                 )
                 producer.flush()
                 log("🏁", f"Perjalanan selesai! {DRIVER['name']} mengantar {RIDER['name']}")
+                _clear_live()
                 return True
 
     log("⚠️", "Batas langkah tercapai sebelum perjalanan selesai")

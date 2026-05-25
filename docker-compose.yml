@@ -1,5 +1,10 @@
 version: '3.8'
 
+networks:
+  ride_net:
+    driver: bridge
+    name: ride_net
+
 services:
 
   zookeeper:
@@ -10,6 +15,8 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
+    networks:
+      - ride_net
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
@@ -27,6 +34,8 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - ride_net
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
@@ -38,3 +47,5 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    networks:
+      - ride_net

@@ -39,7 +39,15 @@ def main():
     print("=" * 60)
 
     try:
-        # 1. Dashboard
+        # 1. Data server (port 8502) — harus start sebelum dashboard & simulasi
+        data_srv = start(
+            "Data server -> port 8502",
+            [PY, os.path.join(BASE, "dashboard", "data_server.py")],
+        )
+        procs.append(("DataServer", data_srv))
+        time.sleep(1)
+
+        # 2. Dashboard
         dash = start(
             "Dashboard  -> http://localhost:8501",
             [PY, "-m", "streamlit", "run",
