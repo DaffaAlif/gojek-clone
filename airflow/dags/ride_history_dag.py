@@ -33,7 +33,7 @@ KAFKA_SERVERS = "kafka:29092"
 TOPIC_MATCHED = "ride-matched"
 TOPIC_STATUS  = "ride-status"
 GROUP_ID      = "airflow-ride-history-matched"
-POSTGRES_CONN = "ride_data_postgres"
+POSTGRES_CONN = "ride_data_supabase"
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS ride_history (
@@ -231,7 +231,6 @@ with DAG(
         task_id="create_table",
         postgres_conn_id=POSTGRES_CONN,
         sql=CREATE_TABLE_SQL,
-        database="ridedata",
     )
 
     consume_kafka = PythonOperator(
