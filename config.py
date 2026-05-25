@@ -6,7 +6,9 @@ TOPICS = {
     'location_updates': 'location-updates',
     'ride_requests':    'ride-requests',
     'ride_matched':     'ride-matched',
-    'ride_status':      'ride-status'
+    'ride_status':      'ride-status',
+    'ride_tracking':    'ride-tracking',
+    'eta_updates':      'eta-updates',
 }
 
 JAKARTA_BOUNDS = {
