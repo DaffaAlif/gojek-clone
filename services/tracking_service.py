@@ -7,11 +7,14 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from datetime import datetime
 from confluent_kafka import Consumer, Producer
 from config import KAFKA_CONFIG, TOPICS
+from services.routing import fetch_osrm_route, step_along_route
 
 # ─── State ────────────────────────────────────────────
 active_rides = {}      # driver_id → ride info
 driver_locations = {}  # driver_id → latest location
 lock = threading.Lock()
+
+ROUTE_STEP = 0.002  # coordinate units per tracking step
 
 def haversine(lat1, lng1, lat2, lng2):
     R = 6371
@@ -24,18 +27,29 @@ def haversine(lat1, lng1, lat2, lng2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 def move_towards(current_lat, current_lng, target_lat, target_lng, step=0.002):
-    """Gerakkan posisi mendekati target"""
+    """Fallback: gerak garis lurus jika OSRM tidak tersedia."""
     d_lat = target_lat - current_lat
     d_lng = target_lng - current_lng
     distance = math.sqrt(d_lat**2 + d_lng**2)
-
     if distance < step:
-        return target_lat, target_lng, True  # sudah sampai
-
+        return target_lat, target_lng, True
     ratio = step / distance
-    new_lat = current_lat + d_lat * ratio
-    new_lng = current_lng + d_lng * ratio
-    return new_lat, new_lng, False  # belum sampai
+    return current_lat + d_lat * ratio, current_lng + d_lng * ratio, False
+
+def _fetch_routes_async(driver_id, from_lat, from_lng, pickup, destination):
+    """Fetch OSRM routes di background thread, simpan ke active_rides."""
+    route_to_pickup = fetch_osrm_route(from_lat, from_lng, pickup['lat'], pickup['lng'])
+    route_to_dest   = fetch_osrm_route(pickup['lat'], pickup['lng'], destination['lat'], destination['lng'])
+    with lock:
+        if driver_id not in active_rides:
+            return
+        active_rides[driver_id]['route_to_pickup'] = route_to_pickup
+        active_rides[driver_id]['route_to_dest']   = route_to_dest
+        active_rides[driver_id]['route_idx']       = 0
+        print(
+            f"[Route] {driver_id}: {len(route_to_pickup)} pts→pickup, "
+            f"{len(route_to_dest)} pts→dest"
+        )
 
 # ─── Thread 1: Pantau ride yang di-match ──────────────
 def listen_matches():
@@ -59,16 +73,27 @@ def listen_matches():
 
             with lock:
                 active_rides[driver_id] = {
-                    "rider_id":    data['rider_id'],
-                    "rider_name":  data['rider_name'],
-                    "driver_id":   driver_id,
-                    "driver_name": data['driver_name'],
-                    "vehicle":     data['vehicle'],
-                    "pickup":      data['pickup'],
-                    "destination": data['destination'],
-                    "phase":       "to_pickup",  # to_pickup → to_destination → completed
-                    "service":     data['service'],
+                    "rider_id":       data['rider_id'],
+                    "rider_name":     data['rider_name'],
+                    "driver_id":      driver_id,
+                    "driver_name":    data['driver_name'],
+                    "vehicle":        data['vehicle'],
+                    "pickup":         data['pickup'],
+                    "destination":    data['destination'],
+                    "phase":          "to_pickup",
+                    "service":        data['service'],
+                    "route_to_pickup": [],
+                    "route_to_dest":   [],
+                    "route_idx":       0,
                 }
+                from_pos = driver_locations.get(driver_id, data['pickup'])
+
+            threading.Thread(
+                target=_fetch_routes_async,
+                args=(driver_id, from_pos['lat'], from_pos['lng'],
+                      data['pickup'], data['destination']),
+                daemon=True,
+            ).start()
 
             # Publish status: accepted
             status_payload = {
@@ -115,16 +140,27 @@ def track_rides():
 
             if ride['phase'] == 'to_pickup':
                 target = ride['pickup']
-                new_lat, new_lng, arrived = move_towards(
-                    current_lat, current_lng,
-                    target['lat'], target['lng']
-                )
+                route  = ride.get('route_to_pickup', [])
+                r_idx  = ride.get('route_idx', 0)
+
+                if route:
+                    new_lat, new_lng, new_idx, arrived = step_along_route(
+                        route, r_idx, current_lat, current_lng, step=ROUTE_STEP
+                    )
+                    with lock:
+                        if driver_id in active_rides:
+                            active_rides[driver_id]['route_idx'] = new_idx
+                else:
+                    new_lat, new_lng, arrived = move_towards(
+                        current_lat, current_lng, target['lat'], target['lng']
+                    )
 
                 if arrived:
                     with lock:
-                        active_rides[driver_id]['phase'] = 'to_destination'
-                    
-                    # Status: pickup
+                        if driver_id in active_rides:
+                            active_rides[driver_id]['phase']     = 'to_destination'
+                            active_rides[driver_id]['route_idx'] = 0
+
                     status = {
                         "driver_id":  driver_id,
                         "rider_id":   ride['rider_id'],
@@ -136,19 +172,28 @@ def track_rides():
                         key=driver_id,
                         value=json.dumps(status)
                     )
-                    print(f"🙋 {ride['driver_name']} menjemput {ride['rider_name']}!")
+                    print(f"[Pickup] {ride['driver_name']} menjemput {ride['rider_name']}!")
 
                 phase_label = "Menuju pickup"
 
             elif ride['phase'] == 'to_destination':
                 target = ride['destination']
-                new_lat, new_lng, arrived = move_towards(
-                    current_lat, current_lng,
-                    target['lat'], target['lng']
-                )
+                route  = ride.get('route_to_dest', [])
+                r_idx  = ride.get('route_idx', 0)
+
+                if route:
+                    new_lat, new_lng, new_idx, arrived = step_along_route(
+                        route, r_idx, current_lat, current_lng, step=ROUTE_STEP
+                    )
+                    with lock:
+                        if driver_id in active_rides:
+                            active_rides[driver_id]['route_idx'] = new_idx
+                else:
+                    new_lat, new_lng, arrived = move_towards(
+                        current_lat, current_lng, target['lat'], target['lng']
+                    )
 
                 if arrived:
-                    # Status: completed
                     status = {
                         "driver_id":  driver_id,
                         "rider_id":   ride['rider_id'],
@@ -160,7 +205,7 @@ def track_rides():
                         key=driver_id,
                         value=json.dumps(status)
                     )
-                    print(f"✅ {ride['driver_name']} selesai antar {ride['rider_name']}!")
+                    print(f"[Done] {ride['driver_name']} selesai antar {ride['rider_name']}!")
 
                     with lock:
                         del active_rides[driver_id]

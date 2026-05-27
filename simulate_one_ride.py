@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from confluent_kafka import Producer, Consumer, KafkaError
 from config import KAFKA_CONFIG, TOPICS
+from services.routing import fetch_osrm_route, step_along_route, count_route_steps
 
 # ─── live_data.json writer (untuk Leaflet map di dashboard) ──────────────────
 
@@ -227,12 +228,14 @@ def do_matching(producer, driver_pos, rider_request):
 
 # ─── Stage: Tracking (step-by-step movement) ─────────────────────────────────
 
-def do_tracking(producer, match_info, sleep_secs=0.2):
+def do_tracking(producer, match_info, sleep_secs=0.2,
+                route_to_pickup=None, route_to_dest=None):
     """Simulate driver moving to pickup then to destination. Returns True on success."""
-    pos = dict(DRIVER_START)
-    phase = "to_pickup"
-    speed  = {"motorcycle": 30, "car": 25}
-    vehicle = DRIVER['vehicle']
+    pos       = dict(DRIVER_START)
+    phase     = "to_pickup"
+    route_idx = 0
+    speed     = {"motorcycle": 30, "car": 25}
+    vehicle   = DRIVER['vehicle']
 
     # Publish accepted status
     producer.produce(
@@ -248,7 +251,7 @@ def do_tracking(producer, match_info, sleep_secs=0.2):
     producer.flush()
     log("✅", f"Status: accepted")
 
-    max_steps = 500
+    max_steps = 2000
     step_count = 0
 
     while step_count < max_steps:
@@ -256,14 +259,21 @@ def do_tracking(producer, match_info, sleep_secs=0.2):
 
         if phase == "to_pickup":
             target = match_info['pickup']
+            route  = route_to_pickup
         else:
             target = match_info['destination']
+            route  = route_to_dest
 
-        new_lat, new_lng, arrived = move_towards(
-            pos['lat'], pos['lng'],
-            target['lat'], target['lng'],
-            step=STEP_SIZE,
-        )
+        if route:
+            new_lat, new_lng, route_idx, arrived = step_along_route(
+                route, route_idx, pos['lat'], pos['lng'], step=STEP_SIZE
+            )
+        else:
+            new_lat, new_lng, arrived = move_towards(
+                pos['lat'], pos['lng'],
+                target['lat'], target['lng'],
+                step=STEP_SIZE,
+            )
         pos = {"lat": new_lat, "lng": new_lng}
 
         distance_to_target = haversine(new_lat, new_lng, target['lat'], target['lng'])
@@ -340,7 +350,8 @@ def do_tracking(producer, match_info, sleep_secs=0.2):
                 )
                 producer.flush()
                 log("🙋", f"{DRIVER['name']} menjemput {RIDER['name']}!")
-                phase = "to_destination"
+                phase     = "to_destination"
+                route_idx = 0  # reset untuk segmen pickup→destination
 
             elif phase == "to_destination":
                 # Publish completed status
@@ -368,16 +379,33 @@ def do_tracking(producer, match_info, sleep_secs=0.2):
 def run_simulation(timeout, duration=60):
     result = {"success": False}
 
-    # Pre-calculate total tracking steps to distribute time evenly
-    fixed_overhead = 3  # 3x time.sleep(1) before tracking starts
-    steps_to_pickup = count_steps(
+    # Fetch road routes dari OSRM sebelum simulasi dimulai
+    log("🗺️", "Mengambil rute jalan dari OSRM...")
+    route_to_pickup = fetch_osrm_route(
         DRIVER_START['lat'], DRIVER_START['lng'],
         PICKUP_LOC['lat'],   PICKUP_LOC['lng'],
     )
-    steps_to_dest = count_steps(
+    route_to_dest = fetch_osrm_route(
         PICKUP_LOC['lat'],  PICKUP_LOC['lng'],
         DEST_LOC['lat'],    DEST_LOC['lng'],
     )
+
+    if route_to_pickup and route_to_dest:
+        log("✅", f"Route OK: {len(route_to_pickup)} pts→pickup, {len(route_to_dest)} pts→dest")
+        steps_to_pickup = count_route_steps(route_to_pickup, STEP_SIZE)
+        steps_to_dest   = count_route_steps(route_to_dest,   STEP_SIZE)
+    else:
+        log("⚠️", "OSRM gagal — fallback ke garis lurus")
+        steps_to_pickup = count_steps(
+            DRIVER_START['lat'], DRIVER_START['lng'],
+            PICKUP_LOC['lat'],   PICKUP_LOC['lng'],
+        )
+        steps_to_dest = count_steps(
+            PICKUP_LOC['lat'],  PICKUP_LOC['lng'],
+            DEST_LOC['lat'],    DEST_LOC['lng'],
+        )
+
+    fixed_overhead = 3
     total_steps = steps_to_pickup + steps_to_dest
     sleep_secs = max(0.05, (duration - fixed_overhead) / total_steps)
 
@@ -411,7 +439,11 @@ def run_simulation(timeout, duration=60):
 
             # 4) Tracking + status updates
             log("🛤️", "Tracking perjalanan dimulai...")
-            success = do_tracking(producer, match_info, sleep_secs=sleep_secs)
+            success = do_tracking(
+                producer, match_info, sleep_secs=sleep_secs,
+                route_to_pickup=route_to_pickup,
+                route_to_dest=route_to_dest,
+            )
 
             print("─" * 60, flush=True)
             if success:
