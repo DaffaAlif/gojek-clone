@@ -188,7 +188,9 @@ MAP_HTML = """<!DOCTYPE html>
   <div id="legend">
     <i class="fa-solid fa-car" style="color:#ff6d00"></i> Driver<br>
     <i class="fa-solid fa-map-pin" style="color:#2e7d32"></i> Pickup<br>
-    <i class="fa-solid fa-map-pin" style="color:#c62828"></i> Tujuan
+    <i class="fa-solid fa-map-pin" style="color:#c62828"></i> Tujuan<br>
+    <span style="display:inline-block;width:18px;height:4px;background:#1565C0;border-radius:2px;vertical-align:middle;margin-right:6px"></span>Menuju pickup<br>
+    <span style="display:inline-block;width:18px;height:4px;background:#42A5F5;border-radius:2px;vertical-align:middle;margin-right:6px"></span>Menuju tujuan
   </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -226,19 +228,62 @@ MAP_HTML = """<!DOCTYPE html>
       });
     }
 
-    var driverMarker = null;
-    var pickupMarker = null;
-    var destMarker   = null;
-    var currentRider = null;
+    var driverMarker  = null;
+    var pickupMarker  = null;
+    var destMarker    = null;
+    var routeToPickup = null;   // biru tua  — driver → pickup
+    var routeToDest   = null;   // biru muda — pickup → destination
+    var currentRider  = null;
     var currentVehicle = null;
-    var firstLoad    = true;
+    var firstLoad     = true;
 
-    var DATA_URL = 'http://localhost:8502/live_data.json';
+    var DATA_URL  = 'http://localhost:8502/live_data.json';
+    var OSRM_BASE = 'https://router.project-osrm.org/route/v1/driving/';
+
+    // Ambil polyline koordinat dari OSRM, panggil cb([latLng, ...])
+    function fetchRoute(from, to, cb) {
+      var url = OSRM_BASE +
+        from.lng + ',' + from.lat + ';' +
+        to.lng   + ',' + to.lat   +
+        '?overview=full&geometries=geojson';
+      fetch(url)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          if (data.routes && data.routes.length > 0) {
+            var coords = data.routes[0].geometry.coordinates.map(function(c) {
+              return [c[1], c[0]];  // [lng,lat] → [lat,lng]
+            });
+            cb(coords);
+          }
+        })
+        .catch(function() {});
+    }
+
+    // Gambar dua segmen rute saat ride pertama kali terdeteksi
+    function drawRoutes(driverPos, pickup, destination) {
+      // Segmen 1: driver → pickup (biru tua)
+      fetchRoute(driverPos, pickup, function(coords) {
+        if (routeToPickup) { map.removeLayer(routeToPickup); }
+        routeToPickup = L.polyline(coords, {
+          color: '#1565C0', weight: 5, opacity: 0.85
+        }).addTo(map);
+      });
+
+      // Segmen 2: pickup → destination (biru muda)
+      fetchRoute(pickup, destination, function(coords) {
+        if (routeToDest) { map.removeLayer(routeToDest); }
+        routeToDest = L.polyline(coords, {
+          color: '#42A5F5', weight: 5, opacity: 0.85
+        }).addTo(map);
+      });
+    }
 
     function clearMarkers() {
-      if (driverMarker) { map.removeLayer(driverMarker); driverMarker = null; }
-      if (pickupMarker) { map.removeLayer(pickupMarker); pickupMarker = null; }
-      if (destMarker)   { map.removeLayer(destMarker);   destMarker   = null; }
+      if (driverMarker)  { map.removeLayer(driverMarker);  driverMarker  = null; }
+      if (pickupMarker)  { map.removeLayer(pickupMarker);  pickupMarker  = null; }
+      if (destMarker)    { map.removeLayer(destMarker);    destMarker    = null; }
+      if (routeToPickup) { map.removeLayer(routeToPickup); routeToPickup = null; }
+      if (routeToDest)   { map.removeLayer(routeToDest);   routeToDest   = null; }
       currentRider   = null;
       currentVehicle = null;
       firstLoad      = true;
@@ -258,14 +303,14 @@ MAP_HTML = """<!DOCTYPE html>
 
           var d = data.drivers[0];
 
-          // Reset markers when a new ride starts
+          // Reset saat ride baru mulai
           if (currentRider !== d.rider_name) {
             clearMarkers();
             currentRider   = d.rider_name;
             currentVehicle = d.vehicle;
           }
 
-          // Driver marker — car or motorcycle icon inside orange circle
+          // Driver marker — car atau motorcycle
           if (!driverMarker) {
             driverMarker = L.marker([d.lat, d.lng], {icon: driverIcon(d.vehicle)})
               .bindPopup('<b>' + d.driver_name + '</b><br>' + d.phase_label)
@@ -274,15 +319,23 @@ MAP_HTML = """<!DOCTYPE html>
             driverMarker.setLatLng([d.lat, d.lng]);
           }
 
-          // Pickup marker — green map-pin (created once)
+          // Pickup marker + gambar rute (dibuat sekali)
           if (d.pickup && !pickupMarker) {
             pickupMarker = L.marker([d.pickup.lat, d.pickup.lng],
               {icon: pinIcon('#2e7d32', 'fa-map-pin')})
               .bindPopup('<b>Pickup</b><br>' + d.rider_name)
               .addTo(map);
+
+            if (d.destination) {
+              drawRoutes(
+                {lat: d.lat, lng: d.lng},
+                d.pickup,
+                d.destination
+              );
+            }
           }
 
-          // Destination marker — red map-pin (created once)
+          // Destination marker (dibuat sekali)
           if (d.destination && !destMarker) {
             destMarker = L.marker([d.destination.lat, d.destination.lng],
               {icon: pinIcon('#c62828', 'fa-map-pin')})
@@ -290,15 +343,15 @@ MAP_HTML = """<!DOCTYPE html>
               .addTo(map);
           }
 
-          // Follow driver
+          // Ikuti driver
           if (firstLoad) {
-            map.setView([d.lat, d.lng], 15);
+            map.setView([d.lat, d.lng], 14);
             firstLoad = false;
           } else {
             map.panTo([d.lat, d.lng], {animate: true, duration: 0.8});
           }
 
-          // Update info box
+          // Info box
           infobox.innerHTML =
             '<b>' + d.driver_name + '</b><br>' +
             '<span style="color:#555">' + d.rider_name + '</span><br>' +
