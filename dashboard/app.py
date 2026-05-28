@@ -231,11 +231,48 @@ MAP_HTML = """<!DOCTYPE html>
     var driverMarker  = null;
     var pickupMarker  = null;
     var destMarker    = null;
-    var routeToPickup = null;   // biru tua  — driver → pickup
-    var routeToDest   = null;   // biru muda — pickup → destination
+    var routeToPickup = null;
+    var routeToDest   = null;
     var currentRider  = null;
     var currentVehicle = null;
     var firstLoad     = true;
+
+    // ── Smooth marker animation ───────────────────────────────────────────────
+    var _animFrame   = null;
+    var _animStart   = null;
+    var _animFromLat = 0, _animFromLng = 0;
+    var _animToLat   = 0, _animToLng   = 0;
+    var ANIM_MS      = 900;  // durasi animasi (sedikit < interval update 1000ms)
+
+    function _ease(t) {
+      // ease-in-out cubic
+      return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+    }
+
+    function animateDriverTo(toLat, toLng) {
+      if (!driverMarker) return;
+      var from     = driverMarker.getLatLng();
+      _animFromLat = from.lat;
+      _animFromLng = from.lng;
+      _animToLat   = toLat;
+      _animToLng   = toLng;
+      if (_animFrame) cancelAnimationFrame(_animFrame);
+      _animStart = null;
+
+      function tick(ts) {
+        if (!_animStart) _animStart = ts;
+        var t = Math.min((ts - _animStart) / ANIM_MS, 1);
+        var e = _ease(t);
+        driverMarker.setLatLng([
+          _animFromLat + (_animToLat - _animFromLat) * e,
+          _animFromLng + (_animToLng - _animFromLng) * e
+        ]);
+        if (t < 1) { _animFrame = requestAnimationFrame(tick); }
+        else        { _animFrame = null; }
+      }
+      _animFrame = requestAnimationFrame(tick);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     var DATA_URL  = 'http://localhost:8502/live_data.json';
     var OSRM_BASE = 'https://router.project-osrm.org/route/v1/driving/';
@@ -279,6 +316,7 @@ MAP_HTML = """<!DOCTYPE html>
     }
 
     function clearMarkers() {
+      if (_animFrame)    { cancelAnimationFrame(_animFrame); _animFrame = null; }
       if (driverMarker)  { map.removeLayer(driverMarker);  driverMarker  = null; }
       if (pickupMarker)  { map.removeLayer(pickupMarker);  pickupMarker  = null; }
       if (destMarker)    { map.removeLayer(destMarker);    destMarker    = null; }
@@ -316,7 +354,7 @@ MAP_HTML = """<!DOCTYPE html>
               .bindPopup('<b>' + d.driver_name + '</b><br>' + d.phase_label)
               .addTo(map);
           } else {
-            driverMarker.setLatLng([d.lat, d.lng]);
+            animateDriverTo(d.lat, d.lng);
           }
 
           // Pickup marker + gambar rute (dibuat sekali)
