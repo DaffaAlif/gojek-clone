@@ -39,21 +39,30 @@ def fetch_osrm_route(from_lat, from_lng, to_lat, to_lng):
 def step_along_route(waypoints, route_idx, current_lat, current_lng, step):
     """
     Gerakkan posisi sejauh `step` coordinate-units mengikuti waypoints.
-
-    Args:
-        waypoints  : list of (lat, lng) dari fetch_osrm_route
-        route_idx  : indeks waypoint yang sudah dicapai
-        current_lat/lng: posisi driver saat ini
-        step       : jarak per langkah dalam satuan koordinat
-
     Returns: (new_lat, new_lng, new_route_idx, arrived)
     """
+    new_lat, new_lng, new_idx, arrived, _ = step_along_route_with_path(
+        waypoints, route_idx, current_lat, current_lng, step
+    )
+    return new_lat, new_lng, new_idx, arrived
+
+
+def step_along_route_with_path(waypoints, route_idx, current_lat, current_lng, step):
+    """
+    Gerakkan posisi sejauh `step` coordinate-units mengikuti waypoints.
+    Selain posisi akhir, kembalikan juga semua titik yang dilalui dalam step ini
+    agar JavaScript bisa menganimasikan marker mengikuti jalan, bukan garis lurus.
+
+    Returns: (new_lat, new_lng, new_route_idx, arrived, path)
+      path: list of [lat, lng] — titik awal hingga titik akhir step ini
+    """
     if not waypoints or route_idx >= len(waypoints) - 1:
-        return current_lat, current_lng, route_idx, True
+        return current_lat, current_lng, route_idx, True, [[current_lat, current_lng]]
 
     lat, lng = current_lat, current_lng
     remaining = step
     idx = route_idx
+    path = [[lat, lng]]
 
     while remaining > 0 and idx < len(waypoints) - 1:
         t_lat, t_lng = waypoints[idx + 1]
@@ -65,14 +74,16 @@ def step_along_route(waypoints, route_idx, current_lat, current_lng, step):
             lat, lng = t_lat, t_lng
             remaining -= dist
             idx += 1
+            path.append([lat, lng])
         else:
             ratio = remaining / dist
             lat += d_lat * ratio
             lng += d_lng * ratio
             remaining = 0
+            path.append([lat, lng])
 
     arrived = idx >= len(waypoints) - 1
-    return lat, lng, idx, arrived
+    return lat, lng, idx, arrived, path
 
 
 def count_route_steps(waypoints, step):

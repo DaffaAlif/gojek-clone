@@ -194,7 +194,6 @@ MAP_HTML = """<!DOCTYPE html>
   </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="https://unpkg.com/leaflet.marker.slideto@0.2.0/Leaflet.Marker.SlideTo.js"></script>
   <script>
     var map = L.map('map', {zoomControl: true}).setView([-6.2088, 106.8456], 13);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -241,6 +240,55 @@ MAP_HTML = """<!DOCTYPE html>
     var DATA_URL  = 'http://localhost:8502/live_data.json';
     var OSRM_BASE = 'https://router.project-osrm.org/route/v1/driving/';
 
+    // ── Path-following animation ──────────────────────────────────────────────
+    var _pathAnimFrame = null;
+
+    function animateAlongPath(points, durationMs) {
+      if (!driverMarker || !points || points.length < 2) return;
+      if (_pathAnimFrame) { cancelAnimationFrame(_pathAnimFrame); _pathAnimFrame = null; }
+
+      // Hitung panjang tiap segmen untuk distribusi waktu proporsional
+      var segLens = [];
+      var totalLen = 0;
+      for (var i = 0; i < points.length - 1; i++) {
+        var dl = points[i+1][0] - points[i][0];
+        var dg = points[i+1][1] - points[i][1];
+        var l  = Math.sqrt(dl*dl + dg*dg);
+        segLens.push(l);
+        totalLen += l;
+      }
+      if (totalLen === 0) { driverMarker.setLatLng(points[points.length-1]); return; }
+
+      // Cumulative ratio [0..1] per titik
+      var cumRatio = [0];
+      for (var i = 0; i < segLens.length; i++) {
+        cumRatio.push(cumRatio[i] + segLens[i] / totalLen);
+      }
+
+      var startTs = null;
+      function tick(ts) {
+        if (!startTs) startTs = ts;
+        var t = Math.min((ts - startTs) / durationMs, 1);
+
+        // Cari segmen yang sesuai dengan t
+        var seg = segLens.length - 1;
+        for (var i = 0; i < cumRatio.length - 1; i++) {
+          if (t <= cumRatio[i + 1]) { seg = i; break; }
+        }
+        var span = cumRatio[seg + 1] - cumRatio[seg];
+        var localT = span > 0 ? (t - cumRatio[seg]) / span : 1;
+
+        var lat = points[seg][0] + (points[seg+1][0] - points[seg][0]) * localT;
+        var lng = points[seg][1] + (points[seg+1][1] - points[seg][1]) * localT;
+        driverMarker.setLatLng([lat, lng]);
+
+        if (t < 1) { _pathAnimFrame = requestAnimationFrame(tick); }
+        else        { _pathAnimFrame = null; }
+      }
+      _pathAnimFrame = requestAnimationFrame(tick);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     // Ambil polyline koordinat dari OSRM, panggil cb([latLng, ...])
     function fetchRoute(from, to, cb) {
       var url = OSRM_BASE +
@@ -280,6 +328,7 @@ MAP_HTML = """<!DOCTYPE html>
     }
 
     function clearMarkers() {
+      if (_pathAnimFrame) { cancelAnimationFrame(_pathAnimFrame); _pathAnimFrame = null; }
       if (driverMarker)  { map.removeLayer(driverMarker);  driverMarker  = null; }
       if (pickupMarker)  { map.removeLayer(pickupMarker);  pickupMarker  = null; }
       if (destMarker)    { map.removeLayer(destMarker);    destMarker    = null; }
@@ -317,7 +366,8 @@ MAP_HTML = """<!DOCTYPE html>
               .bindPopup('<b>' + d.driver_name + '</b><br>' + d.phase_label)
               .addTo(map);
           } else {
-            driverMarker.slideTo([d.lat, d.lng], {duration: 900, keepAtCenter: false});
+            animateAlongPath(d.step_path && d.step_path.length >= 2
+              ? d.step_path : [[d.lat, d.lng]], 950);
           }
 
           // Pickup marker + gambar rute (dibuat sekali)

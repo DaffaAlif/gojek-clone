@@ -27,7 +27,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from confluent_kafka import Producer, Consumer, KafkaError
 from config import KAFKA_CONFIG, TOPICS
-from services.routing import fetch_osrm_route, step_along_route, count_route_steps
+from services.routing import (fetch_osrm_route, step_along_route,
+                              step_along_route_with_path, count_route_steps)
 
 # ─── live_data.json writer (untuk Leaflet map di dashboard) ──────────────────
 
@@ -37,7 +38,8 @@ _LIVE_DATA_PATH = os.path.join(
 )
 
 
-def _write_live(driver, phase_label, lat, lng, pickup, destination, distance_km, eta_minutes):
+def _write_live(driver, phase_label, lat, lng, pickup, destination,
+                distance_km, eta_minutes, step_path=None):
     payload = {
         "drivers": [{
             "driver_id":   driver['driver_id'],
@@ -51,6 +53,7 @@ def _write_live(driver, phase_label, lat, lng, pickup, destination, distance_km,
             "eta_minutes": eta_minutes,
             "pickup":      pickup,
             "destination": destination,
+            "step_path":   [[round(p[0], 6), round(p[1], 6)] for p in (step_path or [])],
         }],
         "updated_at": datetime.now().isoformat(),
     }
@@ -265,7 +268,7 @@ def do_tracking(producer, match_info, sleep_secs=0.2,
             route  = route_to_dest
 
         if route:
-            new_lat, new_lng, route_idx, arrived = step_along_route(
+            new_lat, new_lng, route_idx, arrived, step_path = step_along_route_with_path(
                 route, route_idx, pos['lat'], pos['lng'], step=STEP_SIZE
             )
         else:
@@ -274,6 +277,7 @@ def do_tracking(producer, match_info, sleep_secs=0.2,
                 target['lat'], target['lng'],
                 step=STEP_SIZE,
             )
+            step_path = [[pos['lat'], pos['lng']], [new_lat, new_lng]]
         pos = {"lat": new_lat, "lng": new_lng}
 
         distance_to_target = haversine(new_lat, new_lng, target['lat'], target['lng'])
@@ -329,6 +333,7 @@ def do_tracking(producer, match_info, sleep_secs=0.2,
             DRIVER, phase_label, new_lat, new_lng,
             match_info['pickup'], match_info['destination'],
             distance_to_target, eta,
+            step_path=step_path,
         )
 
         log("📍", f"{DRIVER['name']} | {phase_label} | Sisa: {distance_to_target:.3f} km | ETA: {eta} menit")
