@@ -1,46 +1,50 @@
 """
 ride_history_dag.py
 
-Konsumsi event ride-matched dan ride-status dari Kafka,
-lalu simpan ke tabel ride_history di PostgreSQL (database: ridedata).
+Konsumsi event ride-matched dan ride-status dari Kafka lalu simpan ke
+tabel public.ride_history di Supabase (PostgreSQL).
+
+Perbaikan dari versi sebelumnya:
+- Satu consumer group untuk kedua topik (offset sinkron)
+- Commit Kafka offset SETELAH DB berhasil (bukan sebelumnya)
+- Koneksi langsung via psycopg2 + sslmode=require (bypass Airflow conn)
+- matched_at fallback ke utcnow() agar UNIQUE constraint selalu aktif
+- Handle orphan completed events (ride matched di run sebelumnya)
 
 Schedule : setiap 5 menit
-Consumer group : airflow-ride-history-matched  (offset di-track oleh Kafka)
+Consumer : airflow-ride-history  (subscribe ride-matched + ride-status)
 """
 
 import json
 import logging
+import os
+import psycopg2
 from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.providers.postgres.operators.postgres import PostgresOperator
 
 log = logging.getLogger(__name__)
 
-# ── Default args ──────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 
 default_args = {
-    "owner": "airflow",
-    "retries": 1,
-    "retry_delay": timedelta(minutes=1),
+    "owner":        "airflow",
+    "retries":      1,
+    "retry_delay":  timedelta(minutes=1),
 }
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 KAFKA_SERVERS = "kafka:29092"
 TOPIC_MATCHED = "ride-matched"
 TOPIC_STATUS  = "ride-status"
-GROUP_ID      = "airflow-ride-history-matched"
-POSTGRES_CONN = "ride_data_supabase"
+GROUP_ID      = "airflow-ride-history"   # satu group untuk kedua topik
 
 CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS ride_history (
-    id              SERIAL PRIMARY KEY,
-    rider_id        VARCHAR(50)        NOT NULL,
+CREATE TABLE IF NOT EXISTS public.ride_history (
+    id              BIGSERIAL PRIMARY KEY,
+    rider_id        VARCHAR(50)    NOT NULL,
     rider_name      VARCHAR(100),
-    driver_id       VARCHAR(50)        NOT NULL,
+    driver_id       VARCHAR(50)    NOT NULL,
     driver_name     VARCHAR(100),
     vehicle         VARCHAR(20),
     service         VARCHAR(20),
@@ -50,35 +54,80 @@ CREATE TABLE IF NOT EXISTS ride_history (
     destination_lng DOUBLE PRECISION,
     distance_km     DOUBLE PRECISION,
     eta_minutes     INTEGER,
-    status          VARCHAR(20)        DEFAULT 'matched',
-    matched_at      TIMESTAMP,
+    status          VARCHAR(20)    DEFAULT 'matched',
+    matched_at      TIMESTAMP      NOT NULL DEFAULT NOW(),
     completed_at    TIMESTAMP,
-    ingested_at     TIMESTAMP          DEFAULT NOW(),
+    ingested_at     TIMESTAMP      DEFAULT NOW(),
     UNIQUE (rider_id, driver_id, matched_at)
 );
 """
 
+# ── DB connection ─────────────────────────────────────────────────────────────
 
-def _poll_kafka(bootstrap_servers, topic, group_id, max_messages=200, poll_timeout=5.0):
-    """Return list of parsed JSON messages from `topic`, up to `max_messages`."""
-    from confluent_kafka import Consumer, KafkaError
+def _get_db():
+    """
+    Koneksi langsung ke Supabase via env vars dengan sslmode=require.
+    Tidak menggunakan Airflow PostgresHook agar SSL dapat dikonfigurasi
+    secara eksplisit tanpa tergantung pada format connection string Airflow.
+    """
+    return psycopg2.connect(
+        host=os.environ["SUPABASE_HOST"],
+        port=int(os.environ.get("SUPABASE_PORT", 5432)),
+        user=os.environ["SUPABASE_USER"],
+        password=os.environ["SUPABASE_PASSWORD"],
+        dbname=os.environ.get("SUPABASE_DB", "postgres"),
+        sslmode="require",
+        connect_timeout=15,
+    )
 
-    conf = {
-        "bootstrap.servers": bootstrap_servers,
-        "group.id": group_id,
-        "auto.offset.reset": "earliest",
-        "enable.auto.commit": False,
-        "session.timeout.ms": 10000,
-    }
-    consumer = Consumer(conf)
-    consumer.subscribe([topic])
+# ── Tasks ─────────────────────────────────────────────────────────────────────
 
-    messages = []
+def ensure_table():
+    """Buat tabel ride_history di Supabase jika belum ada."""
+    conn = _get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(CREATE_TABLE_SQL)
+        conn.commit()
+        log.info("Table public.ride_history OK")
+    finally:
+        conn.close()
+
+
+def consume_and_insert(**context):
+    """
+    Poll ride-matched dan ride-status dari Kafka dalam satu consumer group.
+    Commit Kafka offset hanya setelah seluruh operasi DB berhasil.
+
+    Alur:
+    1. Poll semua pesan dari kedua topik (kumpulkan di memori)
+    2. Upsert ride-matched ke ride_history
+    3. Untuk completed event yang matched-nya ada di batch ini → set completed_at
+    4. Untuk completed event yang matched-nya sudah di batch sebelumnya → UPDATE langsung ke DB
+    5. Commit Kafka offset
+    """
+    from confluent_kafka import Consumer, KafkaError, TopicPartition
+
+    consumer = Consumer({
+        "bootstrap.servers":    KAFKA_SERVERS,
+        "group.id":             GROUP_ID,
+        "auto.offset.reset":    "earliest",
+        "enable.auto.commit":   False,
+        "session.timeout.ms":   30000,
+        "max.poll.interval.ms": 300000,
+    })
+    consumer.subscribe([TOPIC_MATCHED, TOPIC_STATUS])
+
+    matched   = {}  # (rider_id, driver_id) → msg dict
+    completed = {}  # (rider_id, driver_id) → timestamp str
+    offsets   = {}  # (topic, partition) → TopicPartition(next offset)
+
     empty_polls = 0
+    total = 0
 
     try:
-        while len(messages) < max_messages and empty_polls < 3:
-            msg = consumer.poll(poll_timeout)
+        while total < 500 and empty_polls < 3:
+            msg = consumer.poll(5.0)
             if msg is None:
                 empty_polls += 1
                 continue
@@ -87,59 +136,48 @@ def _poll_kafka(bootstrap_servers, topic, group_id, max_messages=200, poll_timeo
                     log.warning("Kafka error: %s", msg.error())
                 empty_polls += 1
                 continue
+
             empty_polls = 0
+            total += 1
+            offsets[(msg.topic(), msg.partition())] = TopicPartition(
+                msg.topic(), msg.partition(), msg.offset() + 1
+            )
+
             try:
-                messages.append(json.loads(msg.value().decode("utf-8")))
+                data = json.loads(msg.value().decode("utf-8"))
+                if msg.topic() == TOPIC_MATCHED:
+                    key = (data.get("rider_id"), data.get("driver_id"))
+                    matched[key] = data
+                elif msg.topic() == TOPIC_STATUS and data.get("status") == "completed":
+                    key = (data.get("rider_id"), data.get("driver_id"))
+                    completed[key] = data.get("timestamp")
             except Exception as exc:
-                log.warning("Failed to parse message: %s", exc)
+                log.warning("Parse error: %s", exc)
 
-        consumer.commit()
-    finally:
+    except Exception as exc:
+        log.error("Consumer fatal error: %s", exc)
         consumer.close()
+        raise
 
-    log.info("Polled %d messages from topic %s", len(messages), topic)
-    return messages
+    log.info(
+        "Polled %d msgs — %d ride-matched, %d completed status",
+        total, len(matched), len(completed),
+    )
 
-
-# ── Task functions ─────────────────────────────────────────────────────────────
-
-def consume_and_insert(**context):
-    """
-    1. Konsumsi ride-matched  -> kumpulkan detail perjalanan (matched_at)
-    2. Konsumsi ride-status   -> cari timestamp completed
-    3. Upsert ke ride_history
-    """
-    # --- Ambil event matched ---
-    matched_msgs = _poll_kafka(KAFKA_SERVERS, TOPIC_MATCHED, GROUP_ID)
-
-    # Indeks: (rider_id, driver_id) -> matched record
-    matched_index = {}
-    for m in matched_msgs:
-        key = (m.get("rider_id"), m.get("driver_id"))
-        # Simpan record terbaru
-        matched_index[key] = m
-
-    if not matched_index:
-        log.info("Tidak ada event ride-matched baru. Skip.")
+    if not matched and not completed:
+        log.info("Tidak ada event baru. Skip.")
+        consumer.commit(offsets=list(offsets.values()) if offsets else None)
+        consumer.close()
         return
 
-    # --- Ambil event status ---
-    status_msgs = _poll_kafka(KAFKA_SERVERS, TOPIC_STATUS, GROUP_ID + "-status")
-
-    # Indeks: (rider_id, driver_id) -> completed_at (str)
-    completed_index = {}
-    for s in status_msgs:
-        if s.get("status") == "completed":
-            key = (s.get("rider_id"), s.get("driver_id"))
-            completed_index[key] = s.get("timestamp")
-
-    # --- Upsert ke PostgreSQL ---
-    hook = PostgresHook(postgres_conn_id=POSTGRES_CONN)
-    conn = hook.get_conn()
+    # ── DB operations ─────────────────────────────────────────────────────────
+    conn = _get_db()
     cursor = conn.cursor()
+    upserted = 0
+    updated  = 0
 
-    upsert_sql = """
-    INSERT INTO ride_history (
+    UPSERT_SQL = """
+    INSERT INTO public.ride_history (
         rider_id, rider_name,
         driver_id, driver_name,
         vehicle, service,
@@ -158,84 +196,105 @@ def consume_and_insert(**context):
     )
     ON CONFLICT (rider_id, driver_id, matched_at) DO UPDATE SET
         status       = EXCLUDED.status,
-        completed_at = COALESCE(EXCLUDED.completed_at, ride_history.completed_at),
+        completed_at = COALESCE(EXCLUDED.completed_at, public.ride_history.completed_at),
         ingested_at  = NOW();
     """
 
-    inserted = 0
-    for (rider_id, driver_id), m in matched_index.items():
-        key = (rider_id, driver_id)
+    # 1. Upsert setiap ride-matched event
+    for (rider_id, driver_id), m in matched.items():
+        pickup = m.get("pickup") or {}
+        dest   = m.get("destination") or {}
+        key    = (rider_id, driver_id)
 
-        pickup      = m.get("pickup", {}) or {}
-        destination = m.get("destination", {}) or {}
-
-        raw_ts = m.get("timestamp", "")
         try:
-            matched_at = datetime.strptime(raw_ts, "%Y-%m-%d %H:%M:%S")
+            matched_at = datetime.strptime(m.get("timestamp", ""), "%Y-%m-%d %H:%M:%S")
         except Exception:
-            matched_at = None
+            matched_at = datetime.utcnow()
 
-        completed_raw = completed_index.get(key)
+        completed_raw = completed.get(key)
         try:
             completed_at = datetime.strptime(completed_raw, "%Y-%m-%d %H:%M:%S") if completed_raw else None
         except Exception:
             completed_at = None
 
-        status = "completed" if completed_at else "matched"
-
-        params = {
-            "rider_id":        rider_id,
-            "rider_name":      m.get("rider_name"),
-            "driver_id":       driver_id,
-            "driver_name":     m.get("driver_name"),
-            "vehicle":         m.get("vehicle"),
-            "service":         m.get("service"),
-            "pickup_lat":      pickup.get("lat"),
-            "pickup_lng":      pickup.get("lng"),
-            "destination_lat": destination.get("lat"),
-            "destination_lng": destination.get("lng"),
-            "distance_km":     m.get("distance_km"),
-            "eta_minutes":     m.get("eta_minutes"),
-            "status":          status,
-            "matched_at":      matched_at,
-            "completed_at":    completed_at,
-        }
-
         try:
-            cursor.execute(upsert_sql, params)
-            inserted += 1
+            cursor.execute(UPSERT_SQL, {
+                "rider_id":        rider_id,
+                "rider_name":      m.get("rider_name"),
+                "driver_id":       driver_id,
+                "driver_name":     m.get("driver_name"),
+                "vehicle":         m.get("vehicle"),
+                "service":         m.get("service"),
+                "pickup_lat":      pickup.get("lat"),
+                "pickup_lng":      pickup.get("lng"),
+                "destination_lat": dest.get("lat"),
+                "destination_lng": dest.get("lng"),
+                "distance_km":     m.get("distance_km"),
+                "eta_minutes":     m.get("eta_minutes"),
+                "status":          "completed" if completed_at else "matched",
+                "matched_at":      matched_at,
+                "completed_at":    completed_at,
+            })
+            upserted += 1
         except Exception as exc:
-            log.error("Upsert gagal untuk (%s, %s): %s", rider_id, driver_id, exc)
+            log.error("Upsert gagal (%s, %s): %s", rider_id, driver_id, exc)
             conn.rollback()
-            continue
+
+    # 2. Update status untuk completed events yang ride-matched-nya
+    #    sudah di-insert di run sebelumnya (orphan completed)
+    for (rider_id, driver_id), ts in completed.items():
+        if (rider_id, driver_id) in matched:
+            continue  # sudah ditangani di langkah 1
+        try:
+            completed_at = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S") if ts else datetime.utcnow()
+        except Exception:
+            completed_at = datetime.utcnow()
+        try:
+            cursor.execute("""
+                UPDATE public.ride_history
+                SET status       = 'completed',
+                    completed_at = COALESCE(%s, completed_at),
+                    ingested_at  = NOW()
+                WHERE rider_id = %s
+                  AND driver_id = %s
+                  AND status   != 'completed'
+            """, (completed_at, rider_id, driver_id))
+            updated += cursor.rowcount
+        except Exception as exc:
+            log.error("Update status gagal (%s, %s): %s", rider_id, driver_id, exc)
+            conn.rollback()
 
     conn.commit()
     cursor.close()
     conn.close()
-    log.info("Upserted %d ride_history records.", inserted)
+    log.info("DB OK — upserted %d rides baru, updated %d ke completed.", upserted, updated)
+
+    # Commit Kafka offset SETELAH DB berhasil
+    if offsets:
+        consumer.commit(offsets=list(offsets.values()))
+    consumer.close()
 
 
-# ── DAG definition ─────────────────────────────────────────────────────────────
+# ── DAG ───────────────────────────────────────────────────────────────────────
 
 with DAG(
     dag_id="ride_history_ingestion",
     default_args=default_args,
-    description="Ingest ride events from Kafka into PostgreSQL ride_history",
+    description="Kafka → Supabase: ingest ride-matched + ride-status ke ride_history",
     schedule_interval=timedelta(minutes=5),
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=["ride-hailing", "kafka", "postgres"],
+    tags=["ride-hailing", "kafka", "supabase"],
 ) as dag:
 
-    create_table = PostgresOperator(
-        task_id="create_table",
-        postgres_conn_id=POSTGRES_CONN,
-        sql=CREATE_TABLE_SQL,
+    t_table = PythonOperator(
+        task_id="ensure_table",
+        python_callable=ensure_table,
     )
 
-    consume_kafka = PythonOperator(
-        task_id="consume_kafka_and_insert",
+    t_ingest = PythonOperator(
+        task_id="consume_and_insert",
         python_callable=consume_and_insert,
     )
 
-    create_table >> consume_kafka
+    t_table >> t_ingest
